@@ -2,102 +2,169 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
-import Database from "better-sqlite3";
 import path from "path";
 import { fileURLToPath } from "url";
+import pg from "pg";
+import { createClient } from "redis";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const db = new Database("bera.db");
+// Database connections
+const postgresUrl = process.env.DATABASE_URL || "postgresql://postgres:zMVUWRzlrIBUOxhdCdRFoQMrmsnMymzz@postgres.railway.internal:5432/railway";
+const redisUrl = process.env.REDIS_URL || "redis://default:lfMLtGJUualUPdAZoCKpWdzKBcSHPiRs@shuttle.proxy.rlwy.net:15137";
 
-// Initialize Database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS apps (
-    id TEXT PRIMARY KEY,
-    name TEXT UNIQUE,
-    region TEXT,
-    status TEXT DEFAULT 'idle',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+// PostgreSQL setup
+const { Pool } = pg;
+const pgPool = new Pool({
+  connectionString: postgresUrl,
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+});
 
-  CREATE TABLE IF NOT EXISTS config_vars (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    app_id TEXT,
-    key TEXT,
-    value TEXT,
-    FOREIGN KEY(app_id) REFERENCES apps(id) ON DELETE CASCADE
-  );
+// Redis setup
+const redisClient = createClient({
+  url: redisUrl
+});
 
-  CREATE TABLE IF NOT EXISTS releases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    app_id TEXT,
-    version INTEGER,
-    description TEXT,
-    status TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(app_id) REFERENCES apps(id) ON DELETE CASCADE
-  );
+redisClient.on('error', (err) => console.error('Redis Client Error', err));
+redisClient.on('connect', () => console.log('Redis connected'));
 
-  CREATE TABLE IF NOT EXISTS addons (
-    id TEXT PRIMARY KEY,
-    app_id TEXT,
-    name TEXT,
-    plan TEXT,
-    status TEXT,
-    FOREIGN KEY(app_id) REFERENCES apps(id) ON DELETE CASCADE
-  );
+// Initialize all connections
+async function initializeConnections() {
+  await redisClient.connect();
+  await initializeDatabase();
+}
 
-  CREATE TABLE IF NOT EXISTS logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    app_id TEXT,
-    source TEXT,
-    content TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(app_id) REFERENCES apps(id) ON DELETE CASCADE
-  );
+// Initialize PostgreSQL Tables
+async function initializeDatabase() {
+  const client = await pgPool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS apps (
+        id TEXT PRIMARY KEY,
+        name TEXT UNIQUE,
+        region TEXT,
+        status TEXT DEFAULT 'idle',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
 
-  CREATE TABLE IF NOT EXISTS activity (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    app_id TEXT,
-    actor TEXT,
-    action TEXT,
-    description TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(app_id) REFERENCES apps(id) ON DELETE CASCADE
-  );
+      CREATE TABLE IF NOT EXISTS config_vars (
+        id SERIAL PRIMARY KEY,
+        app_id TEXT REFERENCES apps(id) ON DELETE CASCADE,
+        key TEXT,
+        value TEXT,
+        UNIQUE(app_id, key)
+      );
 
-  CREATE TABLE IF NOT EXISTS addons_catalog (
-    id TEXT PRIMARY KEY,
-    name TEXT,
-    description TEXT,
-    category TEXT,
-    icon TEXT
-  );
+      CREATE TABLE IF NOT EXISTS releases (
+        id SERIAL PRIMARY KEY,
+        app_id TEXT REFERENCES apps(id) ON DELETE CASCADE,
+        version INTEGER,
+        description TEXT,
+        status TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
 
-  // Seed catalog
-  const catalogCount = db.prepare("SELECT COUNT(*) as count FROM addons_catalog").get() as any;
-  if (catalogCount.count === 0) {
-    db.prepare("INSERT INTO addons_catalog (id, name, description, category, icon) VALUES (?, ?, ?, ?, ?)").run("bera-postgresql", "Bera Postgres", "Reliable SQL database", "Data Store", "database");
-    db.prepare("INSERT INTO addons_catalog (id, name, description, category, icon) VALUES (?, ?, ?, ?, ?)").run("bera-redis", "Bera Redis", "In-memory data structure store", "Caching", "zap");
-    db.prepare("INSERT INTO addons_catalog (id, name, description, category, icon) VALUES (?, ?, ?, ?, ?)").run("log-drain", "Log Drain", "External logging integration", "Logging", "terminal");
+      CREATE TABLE IF NOT EXISTS addons (
+        id TEXT PRIMARY KEY,
+        app_id TEXT REFERENCES apps(id) ON DELETE CASCADE,
+        name TEXT,
+        plan TEXT,
+        status TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS logs (
+        id SERIAL PRIMARY KEY,
+        app_id TEXT REFERENCES apps(id) ON DELETE CASCADE,
+        source TEXT,
+        content TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS activity (
+        id SERIAL PRIMARY KEY,
+        app_id TEXT REFERENCES apps(id) ON DELETE CASCADE,
+        actor TEXT,
+        action TEXT,
+        description TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS addons_catalog (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        description TEXT,
+        category TEXT,
+        icon TEXT
+      );
+    `);
+
+    // Seed catalog if empty
+    const catalogCount = await client.query("SELECT COUNT(*) as count FROM addons_catalog");
+    if (parseInt(catalogCount.rows[0].count) === 0) {
+      await client.query(
+        "INSERT INTO addons_catalog (id, name, description, category, icon) VALUES ($1, $2, $3, $4, $5)",
+        ["bera-postgresql", "Bera Postgres", "Reliable SQL database", "Data Store", "database"]
+      );
+      await client.query(
+        "INSERT INTO addons_catalog (id, name, description, category, icon) VALUES ($1, $2, $3, $4, $5)",
+        ["bera-redis", "Bera Redis", "In-memory data structure store", "Caching", "zap"]
+      );
+      await client.query(
+        "INSERT INTO addons_catalog (id, name, description, category, icon) VALUES ($1, $2, $3, $4, $5)",
+        ["log-drain", "Log Drain", "External logging integration", "Logging", "terminal"]
+      );
+      console.log("Catalog seeded");
+    }
+
+    // Seed demo app if empty
+    const appCount = await client.query("SELECT COUNT(*) as count FROM apps");
+    if (parseInt(appCount.rows[0].count) === 0) {
+      const id = "demo-app";
+      await client.query(
+        "INSERT INTO apps (id, name, region, status) VALUES ($1, $2, $3, $4)",
+        [id, "bera-demo-app", "us", "running"]
+      );
+      await client.query(
+        "INSERT INTO config_vars (app_id, key, value) VALUES ($1, $2, $3)",
+        [id, "DATABASE_URL", postgresUrl]
+      );
+      await client.query(
+        "INSERT INTO config_vars (app_id, key, value) VALUES ($1, $2, $3)",
+        [id, "REDIS_URL", redisUrl]
+      );
+      await client.query(
+        "INSERT INTO releases (app_id, version, description, status) VALUES ($1, $2, $3, $4)",
+        [id, 1, "Initial deploy", "succeeded"]
+      );
+      await client.query(
+        "INSERT INTO logs (app_id, source, content) VALUES ($1, $2, $3)",
+        [id, "app", "Server started on port 3000"]
+      );
+      await client.query(
+        "INSERT INTO logs (app_id, source, content) VALUES ($1, $2, $3)",
+        [id, "app", "Connected to PostgreSQL"]
+      );
+      await client.query(
+        "INSERT INTO logs (app_id, source, content) VALUES ($1, $2, $3)",
+        [id, "app", "Connected to Redis"]
+      );
+      await client.query(
+        "INSERT INTO activity (app_id, actor, action, description) VALUES ($1, $2, $3, $4)",
+        [id, "kingvon.kenya@gmail.com", "deploy", "Deployed v1"]
+      );
+      console.log("Demo app seeded");
+    }
+  } finally {
+    client.release();
   }
-
-  // Seed initial data if empty
-  const appCount = db.prepare("SELECT COUNT(*) as count FROM apps").get() as any;
-  if (appCount.count === 0) {
-    const id = "demo-app";
-    db.prepare("INSERT INTO apps (id, name, region, status) VALUES (?, ?, ?, ?)").run(id, "bera-demo-app", "us", "running");
-    db.prepare("INSERT INTO config_vars (app_id, key, value) VALUES (?, ?, ?)").run(id, "DATABASE_URL", "postgres://user:pass@host:5432/db");
-    db.prepare("INSERT INTO releases (app_id, version, description, status) VALUES (?, ?, ?, ?)").run(id, 1, "Initial deploy", "succeeded");
-    db.prepare("INSERT INTO logs (app_id, source, content) VALUES (?, ?, ?)").run(id, "app", "Server started on port 3000");
-    db.prepare("INSERT INTO logs (app_id, source, content) VALUES (?, ?, ?)").run(id, "app", "Connected to database");
-    db.prepare("INSERT INTO activity (app_id, actor, action, description) VALUES (?, ?, ?, ?)").run(id, "kingvon.kenya@gmail.com", "deploy", "Deployed v1");
-  }
-`);
+}
 
 async function startServer() {
+  // Initialize connections
+  await initializeConnections();
+
   const app = express();
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server });
@@ -105,13 +172,13 @@ async function startServer() {
   app.use(express.json());
 
   // WebSocket handling for real-time logs
-  const clients = new Set<websocket>();
+  const clients = new Set<WebSocket>();
   wss.on("connection", (ws) => {
     clients.add(ws);
     ws.on("close", () => clients.delete(ws));
   });
 
-  const broadcastLog = (appId: string, source: string, content: string) => {
+  const broadcastLog = async (appId: string, source: string, content: string) => {
     const logEntry = { appId, source, content, timestamp: new Date().toISOString() };
     const message = JSON.stringify({ type: "log", data: logEntry });
     clients.forEach((client) => {
@@ -119,121 +186,231 @@ async function startServer() {
         client.send(message);
       }
     });
-    // Persist log
-    db.prepare("INSERT INTO logs (app_id, source, content) VALUES (?, ?, ?)").run(appId, source, content);
+    
+    // Persist log to PostgreSQL
+    await pgPool.query(
+      "INSERT INTO logs (app_id, source, content) VALUES ($1, $2, $3)",
+      [appId, source, content]
+    );
+
+    // Also cache recent logs in Redis (last 100 per app)
+    const key = `logs:${appId}`;
+    await redisClient.lPush(key, JSON.stringify(logEntry));
+    await redisClient.lTrim(key, 0, 99);
+    await redisClient.expire(key, 3600); // Expire after 1 hour
   };
 
-  const createRelease = (appId: string, description: string) => {
-    const lastRelease = db.prepare("SELECT MAX(version) as v FROM releases WHERE app_id = ?").get(appId) as any;
-    const nextVersion = (lastRelease?.v || 0) + 1;
-    db.prepare("INSERT INTO releases (app_id, version, description, status) VALUES (?, ?, ?, ?)")
-      .run(appId, nextVersion, description, 'succeeded');
+  const createRelease = async (appId: string, description: string) => {
+    const lastRelease = await pgPool.query(
+      "SELECT COALESCE(MAX(version), 0) as v FROM releases WHERE app_id = $1",
+      [appId]
+    );
+    const nextVersion = parseInt(lastRelease.rows[0].v) + 1;
     
-    db.prepare("INSERT INTO activity (app_id, actor, action, description) VALUES (?, ?, ?, ?)")
-      .run(appId, "system", "release", description);
+    await pgPool.query(
+      "INSERT INTO releases (app_id, version, description, status) VALUES ($1, $2, $3, $4)",
+      [appId, nextVersion, description, 'succeeded']
+    );
+    
+    await pgPool.query(
+      "INSERT INTO activity (app_id, actor, action, description) VALUES ($1, $2, $3, $4)",
+      [appId, "system", "release", description]
+    );
+
+    // Cache the latest release in Redis
+    const release = {
+      version: nextVersion,
+      description,
+      status: 'succeeded',
+      created_at: new Date().toISOString()
+    };
+    await redisClient.set(`release:${appId}:latest`, JSON.stringify(release));
     
     return nextVersion;
   };
 
-  // API Routes
-  app.get("/api/apps", (req, res) => {
-    const apps = db.prepare("SELECT * FROM apps ORDER BY created_at DESC").all();
-    res.json(apps);
+  // Cache middleware
+  const cacheMiddleware = (duration: number) => {
+    return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      const key = `cache:${req.originalUrl}`;
+      const cached = await redisClient.get(key);
+      
+      if (cached) {
+        return res.json(JSON.parse(cached));
+      }
+      
+      // Store original send
+      const originalJson = res.json;
+      res.json = function(body) {
+        redisClient.setEx(key, duration, JSON.stringify(body));
+        return originalJson.call(this, body);
+      };
+      
+      next();
+    };
+  };
+
+  // API Routes with caching where appropriate
+  app.get("/api/apps", cacheMiddleware(30), async (req, res) => {
+    const result = await pgPool.query("SELECT * FROM apps ORDER BY created_at DESC");
+    res.json(result.rows);
   });
 
-  app.post("/api/apps", (req, res) => {
+  app.post("/api/apps", async (req, res) => {
     const { name, region } = req.body;
     const id = Math.random().toString(36).substring(2, 9);
     try {
-      db.prepare("INSERT INTO apps (id, name, region) VALUES (?, ?, ?)").run(id, name, region);
-      const newApp = db.prepare("SELECT * FROM apps WHERE id = ?").get(id);
-      res.json(newApp);
+      await pgPool.query(
+        "INSERT INTO apps (id, name, region) VALUES ($1, $2, $3)",
+        [id, name, region]
+      );
+      const result = await pgPool.query("SELECT * FROM apps WHERE id = $1", [id]);
+      
+      // Clear cache
+      await redisClient.del('cache:/api/apps');
+      
+      res.json(result.rows[0]);
     } catch (e: any) {
       res.status(400).json({ error: e.message });
     }
   });
 
-  app.get("/api/apps/:id", (req, res) => {
-    const appData = db.prepare("SELECT * FROM apps WHERE id = ?").get(req.params.id);
-    if (!appData) return res.status(404).json({ error: "App not found" });
-    res.json(appData);
+  app.get("/api/apps/:id", cacheMiddleware(60), async (req, res) => {
+    const result = await pgPool.query("SELECT * FROM apps WHERE id = $1", [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: "App not found" });
+    res.json(result.rows[0]);
   });
 
-  app.delete("/api/apps/:id", (req, res) => {
-    db.prepare("DELETE FROM apps WHERE id = ?").run(req.params.id);
+  app.delete("/api/apps/:id", async (req, res) => {
+    await pgPool.query("DELETE FROM apps WHERE id = $1", [req.params.id]);
+    
+    // Clear related caches
+    await redisClient.del('cache:/api/apps');
+    await redisClient.del(`cache:/api/apps/${req.params.id}`);
+    await redisClient.del(`logs:${req.params.id}`);
+    
     res.json({ success: true });
   });
 
-  app.get("/api/apps/:id/config", (req, res) => {
-    const vars = db.prepare("SELECT * FROM config_vars WHERE app_id = ?").all(req.params.id);
-    res.json(vars);
+  app.get("/api/apps/:id/config", cacheMiddleware(30), async (req, res) => {
+    const result = await pgPool.query("SELECT * FROM config_vars WHERE app_id = $1", [req.params.id]);
+    res.json(result.rows);
   });
 
-  app.post("/api/apps/:id/config", (req, res) => {
+  app.post("/api/apps/:id/config", async (req, res) => {
     const { key, value } = req.body;
     const appId = req.params.id;
-    db.prepare("INSERT INTO config_vars (app_id, key, value) VALUES (?, ?, ?)").run(appId, key, value);
-    createRelease(appId, `Set config var ${key}`);
+    
+    // Upsert config var
+    await pgPool.query(
+      `INSERT INTO config_vars (app_id, key, value) VALUES ($1, $2, $3)
+       ON CONFLICT (app_id, key) DO UPDATE SET value = $3`,
+      [appId, key, value]
+    );
+    
+    await createRelease(appId, `Set config var ${key}`);
+    
+    // Clear cache
+    await redisClient.del(`cache:/api/apps/${appId}/config`);
+    
     res.json({ success: true });
   });
 
-  app.delete("/api/config/:id", (req, res) => {
-    const configVar = db.prepare("SELECT * FROM config_vars WHERE id = ?").get(req.params.id) as any;
-    if (configVar) {
-      db.prepare("DELETE FROM config_vars WHERE id = ?").run(req.params.id);
-      createRelease(configVar.app_id, `Remove config var ${configVar.key}`);
+  app.delete("/api/config/:id", async (req, res) => {
+    const configVar = await pgPool.query("SELECT * FROM config_vars WHERE id = $1", [req.params.id]);
+    if (configVar.rows.length > 0) {
+      await pgPool.query("DELETE FROM config_vars WHERE id = $1", [req.params.id]);
+      await createRelease(configVar.rows[0].app_id, `Remove config var ${configVar.rows[0].key}`);
+      
+      // Clear cache
+      await redisClient.del(`cache:/api/apps/${configVar.rows[0].app_id}/config`);
     }
     res.json({ success: true });
   });
 
-  app.get("/api/apps/:id/logs", (req, res) => {
-    const logs = db.prepare("SELECT * FROM logs WHERE app_id = ? ORDER BY timestamp DESC LIMIT 100").all(req.params.id);
-    res.json(logs.reverse());
+  app.get("/api/apps/:id/logs", async (req, res) => {
+    // Try to get from Redis cache first
+    const cachedLogs = await redisClient.lRange(`logs:${req.params.id}`, 0, -1);
+    
+    if (cachedLogs.length > 0) {
+      const logs = cachedLogs.map(log => JSON.parse(log)).reverse();
+      return res.json(logs);
+    }
+    
+    // Fallback to PostgreSQL
+    const result = await pgPool.query(
+      "SELECT * FROM logs WHERE app_id = $1 ORDER BY timestamp DESC LIMIT 100",
+      [req.params.id]
+    );
+    res.json(result.rows.reverse());
   });
 
-  app.get("/api/addons/catalog", (req, res) => {
-    const catalog = db.prepare("SELECT * FROM addons_catalog").all();
-    res.json(catalog);
+  app.get("/api/addons/catalog", cacheMiddleware(3600), async (req, res) => {
+    const result = await pgPool.query("SELECT * FROM addons_catalog");
+    res.json(result.rows);
   });
 
-  app.get("/api/apps/:id/addons", (req, res) => {
-    const addons = db.prepare("SELECT * FROM addons WHERE app_id = ?").all(req.params.id);
-    res.json(addons);
+  app.get("/api/apps/:id/addons", cacheMiddleware(30), async (req, res) => {
+    const result = await pgPool.query("SELECT * FROM addons WHERE app_id = $1", [req.params.id]);
+    res.json(result.rows);
   });
 
-  app.post("/api/apps/:id/addons", (req, res) => {
+  app.post("/api/apps/:id/addons", async (req, res) => {
     const { addonId, plan } = req.body;
     const appId = req.params.id;
-    const catalogItem = db.prepare("SELECT * FROM addons_catalog WHERE id = ?").get(addonId) as any;
-    if (!catalogItem) return res.status(404).json({ error: "Addon not found" });
+    
+    const catalogItem = await pgPool.query("SELECT * FROM addons_catalog WHERE id = $1", [addonId]);
+    if (catalogItem.rows.length === 0) return res.status(404).json({ error: "Addon not found" });
 
     const id = Math.random().toString(36).substring(2, 9);
-    db.prepare("INSERT INTO addons (id, app_id, name, plan, status) VALUES (?, ?, ?, ?, ?)")
-      .run(id, appId, catalogItem.name, plan || "Free", "provisioning");
+    await pgPool.query(
+      "INSERT INTO addons (id, app_id, name, plan, status) VALUES ($1, $2, $3, $4, $5)",
+      [id, appId, catalogItem.rows[0].name, plan || "Free", "provisioning"]
+    );
     
     // Inject config var
-    const configKey = catalogItem.name.toUpperCase().replace(/ /g, "_") + "_URL";
-    db.prepare("INSERT INTO config_vars (app_id, key, value) VALUES (?, ?, ?)")
-      .run(appId, configKey, `bera://${addonId}:${Math.random().toString(36).substring(2, 6)}@internal:5432`);
+    const configKey = catalogItem.rows[0].name.toUpperCase().replace(/ /g, "_") + "_URL";
+    const configValue = addonId === 'bera-redis' ? redisUrl : 
+                       addonId === 'bera-postgresql' ? postgresUrl :
+                       `bera://${addonId}:${Math.random().toString(36).substring(2, 6)}@internal:5432`;
+    
+    await pgPool.query(
+      "INSERT INTO config_vars (app_id, key, value) VALUES ($1, $2, $3)",
+      [appId, configKey, configValue]
+    );
 
-    db.prepare("INSERT INTO activity (app_id, actor, action, description) VALUES (?, ?, ?, ?)")
-      .run(appId, "system", "addon:create", `Attached ${catalogItem.name}`);
+    await pgPool.query(
+      "INSERT INTO activity (app_id, actor, action, description) VALUES ($1, $2, $3, $4)",
+      [appId, "system", "addon:create", `Attached ${catalogItem.rows[0].name}`]
+    );
+
+    // Clear caches
+    await redisClient.del(`cache:/api/apps/${appId}/addons`);
+    await redisClient.del(`cache:/api/apps/${appId}/config`);
 
     res.json({ success: true });
   });
 
-  app.get("/api/apps/:id/activity", (req, res) => {
-    const activity = db.prepare("SELECT * FROM activity WHERE app_id = ? ORDER BY timestamp DESC").all(req.params.id);
-    res.json(activity);
+  app.get("/api/apps/:id/activity", cacheMiddleware(30), async (req, res) => {
+    const result = await pgPool.query(
+      "SELECT * FROM activity WHERE app_id = $1 ORDER BY timestamp DESC",
+      [req.params.id]
+    );
+    res.json(result.rows);
   });
 
   app.post("/api/apps/:id/deploy", async (req, res) => {
-    const { repoUrl, branch } = req.body;
+    const { branch } = req.body;
     const appId = req.params.id;
 
-    db.prepare("UPDATE apps SET status = 'deploying' WHERE id = ?").run(appId);
+    await pgPool.query("UPDATE apps SET status = 'deploying' WHERE id = $1", [appId]);
     res.json({ status: "started" });
 
+    const releaseCount = await pgPool.query(
+      "SELECT COUNT(*) as count FROM releases WHERE app_id = $1",
+      [appId]
+    );
+    
     const steps = [
       "-----> Building source...",
       "-----> Cloning repository...",
@@ -249,23 +426,47 @@ async function startServer() {
       "-----> Compressing...",
       "       Done: 42.5MB",
       "-----> Launching...",
-      "       Released v" + (db.prepare("SELECT COUNT(*) as count FROM releases WHERE app_id = ?").get(appId) as any).count + 1,
-      "-----> App is live at https://berahost.up.railway.app/" + appId
+      `       Released v${parseInt(releaseCount.rows[0].count) + 1}`,
+      `-----> App is live at https://berahost.up.railway.app/${appId}`
     ];
 
     for (const step of steps) {
-      broadcastLog(appId, "build", step);
+      await broadcastLog(appId, "build", step);
       await new Promise(r => setTimeout(r, 800));
     }
 
-    db.prepare("UPDATE apps SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(appId);
+    await pgPool.query(
+      "UPDATE apps SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+      [appId]
+    );
     
-    createRelease(appId, `Deploy ${branch || 'main'}`);
+    await createRelease(appId, `Deploy ${branch || 'main'}`);
+
+    // Track deployment in Redis for analytics
+    await redisClient.incr('stats:total_deploys');
+    await redisClient.zAdd('stats:deploys_by_app', {
+      score: Date.now(),
+      value: appId
+    });
   });
 
-  app.get("/api/apps/:id/releases", (req, res) => {
-    const releases = db.prepare("SELECT * FROM releases WHERE app_id = ? ORDER BY version DESC").all(req.params.id);
-    res.json(releases);
+  app.get("/api/apps/:id/releases", cacheMiddleware(60), async (req, res) => {
+    const result = await pgPool.query(
+      "SELECT * FROM releases WHERE app_id = $1 ORDER BY version DESC",
+      [req.params.id]
+    );
+    res.json(result.rows);
+  });
+
+  // Redis stats endpoint
+  app.get("/api/stats", async (req, res) => {
+    const totalDeploys = await redisClient.get('stats:total_deploys') || '0';
+    const recentDeploys = await redisClient.zRange('stats:deploys_by_app', 0, -1, { REV: true });
+    
+    res.json({
+      totalDeploys: parseInt(totalDeploys),
+      recentDeploys: recentDeploys.slice(0, 10)
+    });
   });
 
   // Vite middleware for development
@@ -282,10 +483,20 @@ async function startServer() {
     });
   }
 
-  const PORT = 3000;
+  const PORT = process.env.PORT || 3000;
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`Bera Host Server running on http://0.0.0.0:${PORT}`);
+    console.log(`PostgreSQL: Connected`);
+    console.log(`Redis: Connected`);
   });
 }
 
-startServer();
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, closing connections...');
+  await redisClient.quit();
+  await pgPool.end();
+  process.exit(0);
+});
+
+startServer().catch(console.error);
